@@ -2861,6 +2861,7 @@ export async function scheduled(ctx) {
     [
       "roster-notification",
       "roster-inbox-reply",
+      "roster-public-menu-reply",
       "roster-venues-complete",
       "roster-layout-timed",
       "roster-burrows",
@@ -3284,6 +3285,28 @@ export async function dispatchRosterJob(job, env, now = Date.now()) {
       to: payload.to,
       subject: payload.subject,
       text: content.body,
+      idempotencyKey: job.job_id,
+    });
+  }
+  if (job.type === "roster-public-menu-reply") {
+    const inbound = await one(
+      env.DB,
+      "SELECT * FROM roster_inbox WHERE school_id=? AND message_id=?",
+      [schoolId, payload.inReplyTo],
+    );
+    if (
+      !inbound ||
+      Operations.mobile(JSON.parse(inbound.payload_json).sender) !==
+        Operations.mobile(payload.to) ||
+      now - inbound.received_at >= 86400000
+    )
+      return { state: "cancelled", code: "INBOX_REPLY_WINDOW_CLOSED" };
+    await assertJobLease(env, job, now);
+    return dispatchProvider(env, {
+      provider: "whatsapp",
+      to: payload.to,
+      text: payload.text,
+      recentInboundAt: inbound.received_at,
       idempotencyKey: job.job_id,
     });
   }
