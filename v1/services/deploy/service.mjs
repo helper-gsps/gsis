@@ -1328,14 +1328,194 @@ async function save(
     },
     {
       dependencies: extraDependencies,
-      audit: {
-        versionId: b.versionId,
-        scope,
-        changedRows: delta.changedRows,
-        previewId: preview?.id || null,
-      },
+      audit: buildSaveAudit(ctx, op, b, loaded, next, delta, scope, preview),
     },
   );
+}
+const AUDIT_OP_LABELS = Object.freeze({
+  setLoad: "Update subject load",
+  addSubject: "Add subject",
+  addLevel: "Add level",
+  addClass: "Add class",
+  updateClass: "Update class",
+  renameClasses: "Rename classes",
+  setClassAbility: "Update class ability",
+  deleteClass: "Delete class",
+  addTeacher: "Assign teacher",
+  removeTeacher: "Remove teacher",
+  setTeacherField: "Update teacher profile",
+  upsertTeacherProfile: "Update teacher profile",
+  setTeacherNote: "Update teacher note",
+  setTeacherMemberships: "Update teacher memberships",
+  setRoleMemberships: "Update role memberships",
+  setHRChoices: "Update HR choices",
+  addTG: "Add teaching group",
+  updateTG: "Update teaching group",
+  removeTG: "Remove teaching group",
+  moveTG: "Move teaching group",
+  moveClass: "Move class",
+  clearVenueAssignments: "Clear venue assignments",
+  moveVenueGroup: "Move venue group",
+  moveClassBlock: "Move class block",
+  setLevelExclusions: "Update exclusions",
+  setExclusionCell: "Update exclusions",
+  setOffload: "Update offload",
+  setReliefSettings: "Update relief settings",
+  setWorkload: "Update workload",
+  setSubjectType: "Update subject type",
+  setFortnight: "Update fortnight",
+  setOrganisation: "Update organisation",
+  setDuties: "Update duties",
+  setAscExportSettings: "Update aSc export settings",
+  patchPlanning: "Update planning settings",
+  initReporting: "Initialise reporting",
+  setReportingOfficer: "Update reporting officer",
+  upsertClassNameSet: "Update class name set",
+  deleteClassNameSet: "Delete class name set",
+  saveVersionNote: "Save version note",
+  metadata: "Update version metadata",
+});
+const MAX_AUDIT_ENTRIES = 20;
+const MAX_AUDIT_BYTES = 12 * 1024;
+function parseAuditValue(raw) {
+  if (raw === undefined || raw === null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+function diffAuditEntry(beforeVal, afterVal) {
+  if (isPlainObject(beforeVal) && isPlainObject(afterVal)) {
+    const beforeOut = {},
+      afterOut = {};
+    for (const key of new Set([
+      ...Object.keys(beforeVal),
+      ...Object.keys(afterVal),
+    ])) {
+      if (canonical(beforeVal[key]) === canonical(afterVal[key])) continue;
+      beforeOut[key] = beforeVal[key] ?? null;
+      afterOut[key] = afterVal[key] ?? null;
+    }
+    return { beforeVal: beforeOut, afterVal: afterOut };
+  }
+  return { beforeVal, afterVal };
+}
+function labelForOperations(b, preview) {
+  if (preview) {
+    return {
+      operationLabel: "Import workbook",
+      operations: ["importWorkbook"],
+      editCount: 1,
+    };
+  }
+  if (b.operation === "saveVersionNote") {
+    return {
+      operationLabel: AUDIT_OP_LABELS.saveVersionNote,
+      operations: ["saveVersionNote"],
+      editCount: 1,
+    };
+  }
+  const edits = Array.isArray(b.edits) && b.edits.length ? b.edits : [b];
+  const ops = edits
+    .map((e) => (typeof e?.operation === "string" ? e.operation : ""))
+    .filter(Boolean);
+  const uniqueLabels = [];
+  for (const opName of ops) {
+    const label = AUDIT_OP_LABELS[opName] || opName;
+    if (!uniqueLabels.includes(label)) uniqueLabels.push(label);
+  }
+  let operationLabel = uniqueLabels[0] || "Save planning changes";
+  if (edits.length > 1) {
+    const summary = uniqueLabels.join(", ");
+    const full = `Batch edit (${edits.length} edits)${summary ? `: ${summary}` : ""}`;
+    operationLabel = full.length > 160 ? `${full.slice(0, 157)}...` : full;
+  }
+  return {
+    operationLabel,
+    operations: ops.slice(0, MAX_AUDIT_ENTRIES),
+    editCount: edits.length,
+  };
+}
+function buildSaveAudit(ctx, op, b, loaded, next, delta, scope, preview) {
+  const { operationLabel, operations, editCount } = labelForOperations(
+    b,
+    preview,
+  );
+  const actorLabel =
+    typeof ctx.principal?.email === "string" && ctx.principal.email.trim()
+      ? ctx.principal.email.trim()
+      : null;
+  const oldMap = new Map(
+    (loaded.rows || []).map((row) => [`${row.scope}\0${row.row_id}`, row.value]),
+  );
+  const nextMap = flatten(next);
+  const before = {},
+    after = {};
+  let capturedChanges = 0,
+    omittedChanges = 0,
+    bytes = 0,
+    truncated = false;
+  const pushEntry = (entryKey, prevVal, nextVal) => {
+    if (capturedChanges >= MAX_AUDIT_ENTRIES) {
+      omittedChanges += 1;
+      truncated = true;
+      return;
+    }
+    const diff = diffAuditEntry(prevVal, nextVal);
+    const entryBytes = new TextEncoder().encode(
+      canonical({ k: entryKey, b: diff.beforeVal, a: diff.afterVal }),
+    ).byteLength;
+    if (bytes + entryBytes > MAX_AUDIT_BYTES) {
+      omittedChanges += 1;
+      truncated = true;
+      return;
+    }
+    before[entryKey] = diff.beforeVal;
+    after[entryKey] = diff.afterVal;
+    capturedChanges += 1;
+    bytes += entryBytes;
+  };
+  for (const metaKey of ["name", "from", "to", "notes"]) {
+    const prevMeta = loaded.doc?.[metaKey] ?? "";
+    const nextMeta = next?.[metaKey] ?? "";
+    if (prevMeta !== nextMeta) {
+      pushEntry(`meta:${metaKey}`, prevMeta, nextMeta);
+    }
+  }
+  for (const key of new Set([...oldMap.keys(), ...nextMap.keys()])) {
+    const prior = oldMap.get(key),
+      value = nextMap.get(key);
+    if (prior === value) continue;
+    const [rowScope, rowId] = key.split("\0");
+    if (rowScope === "_orders") continue;
+    pushEntry(
+      `${rowScope}:${rowId}`,
+      parseAuditValue(prior),
+      parseAuditValue(value),
+    );
+  }
+  return {
+    versionId: b.versionId,
+    scope,
+    changedRows: delta.changedRows,
+    previewId: preview?.id || null,
+    operationId: op.operationId,
+    originalActor: ctx.principal.actorId,
+    actorLabel,
+    capabilityAction: op.action,
+    operationLabel,
+    operations,
+    editCount,
+    before,
+    after,
+    capturedChanges,
+    omittedChanges,
+    truncated,
+  };
 }
 function workbookDocument(document, scope, ref = null) {
   if (["IP", "TG"].includes(scope)) return canonicalTeachingDocument(document);
